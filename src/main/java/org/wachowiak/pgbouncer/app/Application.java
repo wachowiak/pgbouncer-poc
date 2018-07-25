@@ -4,7 +4,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.sql.*;
-import java.util.Properties;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.stream.IntStream;
 
@@ -12,52 +12,72 @@ public class Application {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(Application.class);
 
+    private static final String MODE_DISABLED = "-n";
+    private static final String MODE_LOCAL_CP = "-l";
+    private static final String MODE_REMOTE_CP = "-r";
 
-    public static void main(String[] args) throws Exception {
+    private static final String QUERY_DATE = "select now()";
 
-        Class.forName("org.postgresql.Driver");
+    private final ConnectionProvider connectionProvider;
 
-//        Executors.callable(Application.runPool(new DbProperties("jdbc:postgresql://localhost/pgdemo", "pgdemo", "pgdemo"))).call();
-        Executors.callable(Application.runPool(new DbProperties("jdbc:postgresql://localhost/pgbouncer", "pgbouncer", "pgbouncer"))).call();
+    Application(ConnectionProvider connectionProvider) {
+        this.connectionProvider = connectionProvider;
     }
 
-    private static Runnable runPool(DbProperties dbProperties) {
+    public static void main(String[] args) {
 
-        return () -> IntStream.range(1, 10000).parallel().forEach(t -> {
+        String mode = args.length == 0 ? MODE_DISABLED : args[0];
 
-            long before = System.nanoTime() / 1000000;
-            try (Connection conn = DriverManager.getConnection(dbProperties.getUrl(), dbProperties.getProperties())) {
-                Statement statement = conn.createStatement();
-
-                ResultSet rs = statement.executeQuery("select now()");
-                while (rs.next()) {
-                    LOGGER.debug(rs.getDate(1).toString());
-                }
-            } catch (SQLException e) {
-                LOGGER.error("fail", e);
+        ConnectionProvider provider;
+        switch (mode) {
+            case MODE_REMOTE_CP: {
+                provider = new PgBouncerConnectionProvider("jdbc:postgresql://vm:6432/pgdemo", "pgdemo", "pgdemo");
+                break;
             }
-            LOGGER.info("Processing time: {} ms", System.nanoTime() / 1000000 - before);
-        });
+            case MODE_LOCAL_CP: {
+                provider = new HikariConnectionProvider("jdbc:postgresql://localhost:5432/pgdemo", "pgdemo", "pgdemo");
+                break;
+            }
+            case MODE_DISABLED:
+            default: {
+                provider = new RawConnectionProvider("jdbc:postgresql://localhost:5432/pgdemo", "pgdemo", "pgdemo");
+                break;
+            }
+
+        }
+        new Application(provider).runPool();
     }
 
-    private static class DbProperties{
-        private String url;
-        private Properties properties;
 
-        DbProperties(String url, String user, String password) {
-            this.url = url;
-            properties = new Properties();
-            properties.setProperty("user", user);
-            properties.setProperty("password", password);
+    private void runPool() {
+        int poolSize = 100;
+        int callsPerClient = 10000;
+        ExecutorService service = Executors.newFixedThreadPool(poolSize);
+        IntStream.range(1, poolSize).parallel().forEach(i ->
+                service.submit(() -> IntStream.range(1, callsPerClient).parallel().forEach(c -> askForDate()))
+        );
+    }
+
+    private void askForDate() {
+
+        long before = System.currentTimeMillis();
+        Timestamp dbDate = executeSingleResultQuery(QUERY_DATE, Timestamp.class);
+        LOGGER.info("Result: {}. Processing time: {} ms", dbDate, System.currentTimeMillis() - before);
+    }
+
+    private <T> T executeSingleResultQuery(String query, Class<T> clazz) {
+        try (Connection conn = connectionProvider.getConnection()) {
+            Statement statement = conn.createStatement();
+
+            ResultSet rs = statement.executeQuery(query);
+            if (rs.next()) {
+                return clazz.cast(rs.getObject(1));
+            }
+
+        } catch (SQLException e) {
+            LOGGER.error("query execution failed", e);
+            throw new DatabaseException(e);
         }
-
-
-        String getUrl() {
-            return url;
-        }
-
-        Properties getProperties() {
-            return properties;
-        }
+        throw new DatabaseException("No data returned");
     }
 }
